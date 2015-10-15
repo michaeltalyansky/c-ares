@@ -266,6 +266,14 @@ struct ares_options {
   int ednspsz;
 };
 
+#include <poll.h>
+
+struct ares_pollfds {
+  size_t cap;         /* The number of pollfds allocated */
+  nfds_t nfds;        /* The number of pollfds used */
+  struct pollfd *fds; /* Array of pollfds */
+};
+
 struct hostent;
 struct timeval;
 struct sockaddr;
@@ -386,6 +394,9 @@ CARES_EXTERN int ares_fds(ares_channel channel,
                           fd_set *read_fds,
                           fd_set *write_fds);
 
+CARES_EXTERN int ares_poll_fds(ares_channel channel,
+                               struct ares_pollfds *fds);
+
 CARES_EXTERN int ares_getsock(ares_channel channel,
                               ares_socket_t *socks,
                               int numsocks);
@@ -397,6 +408,9 @@ CARES_EXTERN struct timeval *ares_timeout(ares_channel channel,
 CARES_EXTERN void ares_process(ares_channel channel,
                                fd_set *read_fds,
                                fd_set *write_fds);
+
+CARES_EXTERN void ares_process_poll(ares_channel channel,
+                                    struct ares_pollfds *fds);
 
 CARES_EXTERN void ares_process_fd(ares_channel channel,
                                   ares_socket_t read_fd,
@@ -542,8 +556,8 @@ CARES_EXTERN int ares_parse_naptr_reply(const unsigned char* abuf,
                                         struct ares_naptr_reply** naptr_out);
 
 CARES_EXTERN int ares_parse_soa_reply(const unsigned char* abuf,
-				      int alen,
-				      struct ares_soa_reply** soa_out);
+                                      int alen,
+                                      struct ares_soa_reply** soa_out);
 
 CARES_EXTERN void ares_free_string(void *str);
 

@@ -59,11 +59,14 @@
 
 static int try_again(int errnum);
 static void write_tcp_data(ares_channel channel, fd_set *write_fds,
-                           ares_socket_t write_fd, struct timeval *now);
+                           ares_socket_t write_fd, struct ares_pollfds *pfds,
+                           struct timeval *now);
 static void read_tcp_data(ares_channel channel, fd_set *read_fds,
-                          ares_socket_t read_fd, struct timeval *now);
+                          ares_socket_t read_fd, struct ares_pollfds *pfds,
+                          struct timeval *now);
 static void read_udp_packets(ares_channel channel, fd_set *read_fds,
-                             ares_socket_t read_fd, struct timeval *now);
+                             ares_socket_t read_fd, struct ares_pollfds *pfds,
+                             struct timeval *now);
 static void advance_tcp_send_queue(ares_channel channel, int whichserver,
                                    ssize_t num_bytes);
 static void process_timeouts(ares_channel channel, struct timeval *now);
@@ -118,13 +121,14 @@ static void timeadd(struct timeval *now, int millisecs)
  */
 static void processfds(ares_channel channel,
                        fd_set *read_fds, ares_socket_t read_fd,
-                       fd_set *write_fds, ares_socket_t write_fd)
+                       fd_set *write_fds, ares_socket_t write_fd,
+                       struct ares_pollfds *pfds)
 {
   struct timeval now = ares__tvnow();
 
-  write_tcp_data(channel, write_fds, write_fd, &now);
-  read_tcp_data(channel, read_fds, read_fd, &now);
-  read_udp_packets(channel, read_fds, read_fd, &now);
+  write_tcp_data(channel, write_fds, write_fd, pfds, &now);
+  read_tcp_data(channel, read_fds, read_fd, pfds, &now);
+  read_udp_packets(channel, read_fds, read_fd, pfds, &now);
   process_timeouts(channel, &now);
   process_broken_connections(channel, &now);
 }
@@ -134,7 +138,15 @@ static void processfds(ares_channel channel,
  */
 void ares_process(ares_channel channel, fd_set *read_fds, fd_set *write_fds)
 {
-  processfds(channel, read_fds, ARES_SOCKET_BAD, write_fds, ARES_SOCKET_BAD);
+  processfds(channel, read_fds, ARES_SOCKET_BAD, write_fds, ARES_SOCKET_BAD, NULL);
+}
+
+/* Something interesting happened on the wire, or there was a timeout.
+ * See what's up and respond accordingly.
+ */
+void ares_process_poll(ares_channel channel, struct ares_pollfds *fds)
+{
+  processfds(channel, NULL, ARES_SOCKET_BAD, NULL, ARES_SOCKET_BAD, fds);
 }
 
 /* Something interesting happened on the wire, or there was a timeout.
@@ -145,7 +157,7 @@ void ares_process_fd(ares_channel channel,
                                                file descriptors */
                      ares_socket_t write_fd)
 {
-  processfds(channel, NULL, read_fd, NULL, write_fd);
+  processfds(channel, NULL, read_fd, NULL, write_fd, NULL);
 }
 
 
@@ -175,12 +187,29 @@ static int try_again(int errnum)
   return 0;
 }
 
+/* Find the pollfd entry that matches this socket. Start with pfd_i.
+ * The index returned may not be the match. If not, it will be 0.
+ * Because we build the poll list in order of channel->nservers and we
+ * are scanning it in the same order this should never miss one.
+ */
+static nfds_t find_pollfd(struct ares_pollfds *pfds, nfds_t pfd_i, ares_socket_t target)
+{
+  nfds_t i;
+
+  for(i = pfd_i; i < pfds->nfds; i++) {
+    if (pfds->fds[i].fd == target)
+      return i;
+  }
+  return 0;
+}
+
 /* If any TCP sockets select true for writing, write out queued data
  * we have for them.
  */
 static void write_tcp_data(ares_channel channel,
                            fd_set *write_fds,
                            ares_socket_t write_fd,
+                           struct ares_pollfds *pfds,
                            struct timeval *now)
 {
   struct server_state *server;
@@ -190,15 +219,17 @@ static void write_tcp_data(ares_channel channel,
   ssize_t scount;
   ssize_t wcount;
   size_t n;
+  nfds_t pfd_i;
 
-  if(!write_fds && (write_fd == ARES_SOCKET_BAD))
+  if(!write_fds && (write_fd == ARES_SOCKET_BAD) && !pfds)
     /* no possible action */
     return;
 
+  pfd_i = 0;
   for (i = 0; i < channel->nservers; i++)
     {
       /* Make sure server has data to send and is selected in write_fds or
-         write_fd. */
+         write_fd or pfds. */
       server = &channel->servers[i];
       if (!server->qhead || server->tcp_socket == ARES_SOCKET_BAD ||
           server->is_broken)
@@ -207,19 +238,26 @@ static void write_tcp_data(ares_channel channel,
       if(write_fds) {
         if(!FD_ISSET(server->tcp_socket, write_fds))
           continue;
-      }
-      else {
-        if(server->tcp_socket != write_fd)
-          continue;
-      }
-
-      if(write_fds)
         /* If there's an error and we close this socket, then open
          * another with the same fd to talk to another server, then we
          * don't want to think that it was the new socket that was
          * ready. This is not disastrous, but is likely to result in
          * extra system calls and confusion. */
         FD_CLR(server->tcp_socket, write_fds);
+      }
+      else if (pfds) {
+        pfd_i = find_pollfd(pfds, pfd_i, server->tcp_socket);
+        if (server->tcp_socket != pfds->fds[pfd_i].fd)
+          continue;
+        if (!(pfds->fds[pfd_i].revents & (POLL_OUT | POLL_ERR | POLL_HUP)))
+          continue;
+        /* Clear the POLL_OUT event, just like we do for select. */
+        pfds->fds[pfd_i].revents &= ~(POLL_OUT | POLL_ERR | POLL_HUP);
+      }
+      else {
+        if(server->tcp_socket != write_fd)
+          continue;
+      }
 
       /* Count the number of send queue items. */
       n = 0;
@@ -304,16 +342,19 @@ static void advance_tcp_send_queue(ares_channel channel, int whichserver,
  * a packet if we finish reading one.
  */
 static void read_tcp_data(ares_channel channel, fd_set *read_fds,
-                          ares_socket_t read_fd, struct timeval *now)
+                          ares_socket_t read_fd, struct ares_pollfds *pfds,
+                          struct timeval *now)
 {
   struct server_state *server;
   int i;
+  nfds_t pfd_i;
   ssize_t count;
 
-  if(!read_fds && (read_fd == ARES_SOCKET_BAD))
+  if(!read_fds && (read_fd == ARES_SOCKET_BAD) && !pfds)
     /* no possible action */
     return;
 
+  pfd_i = 0;
   for (i = 0; i < channel->nservers; i++)
     {
       /* Make sure the server has a socket and is selected in read_fds. */
@@ -324,19 +365,26 @@ static void read_tcp_data(ares_channel channel, fd_set *read_fds,
       if(read_fds) {
         if(!FD_ISSET(server->tcp_socket, read_fds))
           continue;
-      }
-      else {
-        if(server->tcp_socket != read_fd)
-          continue;
-      }
-
-      if(read_fds)
         /* If there's an error and we close this socket, then open another
          * with the same fd to talk to another server, then we don't want to
          * think that it was the new socket that was ready. This is not
          * disastrous, but is likely to result in extra system calls and
          * confusion. */
         FD_CLR(server->tcp_socket, read_fds);
+      }
+      else if (pfds) {
+        pfd_i = find_pollfd(pfds, pfd_i, server->tcp_socket);
+        if (server->tcp_socket != pfds->fds[pfd_i].fd)
+          continue;
+        if (!(pfds->fds[pfd_i].revents & (POLL_IN | POLL_ERR | POLL_HUP)))
+          continue;
+        /* Clear the POLL_IN event, just like we do for select. */
+        pfds->fds[pfd_i].revents &= ~(POLL_IN | POLL_ERR | POLL_HUP);
+      }
+      else {
+        if(server->tcp_socket != read_fd)
+          continue;
+      }
 
       if (server->tcp_lenbuf_pos != 2)
         {
@@ -400,10 +448,12 @@ static void read_tcp_data(ares_channel channel, fd_set *read_fds,
 
 /* If any UDP sockets select true for reading, process them. */
 static void read_udp_packets(ares_channel channel, fd_set *read_fds,
-                             ares_socket_t read_fd, struct timeval *now)
+                             ares_socket_t read_fd, struct ares_pollfds *pfds,
+                             struct timeval *now)
 {
   struct server_state *server;
   int i;
+  nfds_t pfd_i;
   ssize_t count;
   unsigned char buf[MAXENDSSZ + 1];
 #ifdef HAVE_RECVFROM
@@ -415,10 +465,11 @@ static void read_udp_packets(ares_channel channel, fd_set *read_fds,
   } from;
 #endif
 
-  if(!read_fds && (read_fd == ARES_SOCKET_BAD))
+  if(!read_fds && (read_fd == ARES_SOCKET_BAD) && !pfds)
     /* no possible action */
     return;
 
+  pfd_i = 0;
   for (i = 0; i < channel->nservers; i++)
     {
       /* Make sure the server has a socket and is selected in read_fds. */
@@ -430,19 +481,25 @@ static void read_udp_packets(ares_channel channel, fd_set *read_fds,
       if(read_fds) {
         if(!FD_ISSET(server->udp_socket, read_fds))
           continue;
-      }
-      else {
-        if(server->udp_socket != read_fd)
-          continue;
-      }
-
-      if(read_fds)
         /* If there's an error and we close this socket, then open
          * another with the same fd to talk to another server, then we
          * don't want to think that it was the new socket that was
          * ready. This is not disastrous, but is likely to result in
          * extra system calls and confusion. */
         FD_CLR(server->udp_socket, read_fds);
+      } else if (pfds) {
+        pfd_i = find_pollfd(pfds, pfd_i, server->udp_socket);
+        if (server->udp_socket != pfds->fds[pfd_i].fd)
+          continue;
+        if (!(pfds->fds[pfd_i].revents & (POLL_IN | POLL_ERR | POLL_HUP)))
+          continue;
+        /* Clear the POLL_IN event, just like we do for select. */
+        pfds->fds[pfd_i].revents &= ~(POLL_IN | POLL_ERR | POLLHUP);
+      }
+      else {
+        if(server->udp_socket != read_fd)
+          continue;
+      }
 
       /* To reduce event loop overhead, read and process as many
        * packets as we can. */
