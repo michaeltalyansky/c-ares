@@ -980,11 +980,17 @@ static int configure_socket(ares_socket_t s, int family, ares_channel channel)
 
 #ifdef SO_BINDTODEVICE
   if (channel->local_dev_name[0]) {
+    /* raise to root, if the caller can do this */
+    int r = setreuid(geteuid(), getuid());
+    (void)r;
     if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE,
                    channel->local_dev_name, sizeof(channel->local_dev_name))) {
       /* Only root can do this, and usually not fatal if it doesn't work, so */
       /* just continue on. */
     }
+    /* back to normal privileges */
+    r = setreuid(geteuid(), getuid());
+    (void)r;
   }
 #endif
 
